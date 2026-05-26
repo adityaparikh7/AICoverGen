@@ -1,0 +1,16 @@
+cd /d D:\AI\AICoverGen
+
+
+cd /d D:\AI\AICoverGen
+aicovergen\Scripts\activate
+python src\voice_only.py
+
+cd /d D:\AI\AICoverGen
+aicovergen\Scripts\activate
+python src\split_audio.py
+
+cd /d D:\AI\AICoverGen
+aicovergen\Scripts\activate
+python src\webui.py
+
+deactivate
