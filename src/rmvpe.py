@@ -329,7 +329,10 @@ class RMVPE:
     def __init__(self, model_path, is_half, device=None):
         self.resample_kernel = {}
         model = E2E(4, 1, (2, 2))
-        ckpt = torch.load(model_path, map_location="cpu")
+        try:
+            ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            ckpt = torch.load(model_path, map_location="cpu")
         model.load_state_dict(ckpt)
         model.eval()
         if is_half == True:

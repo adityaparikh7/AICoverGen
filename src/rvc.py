@@ -97,7 +97,18 @@ class Config:
 
 
 def load_hubert(device, is_half, model_path):
-    models, saved_cfg, task = checkpoint_utils.load_model_ensemble_and_task([model_path], suffix='', )
+    original_load = torch.load
+    def patched_load(*args, **kwargs):
+        try:
+            return original_load(*args, **kwargs, weights_only=False)
+        except TypeError:
+            return original_load(*args, **kwargs)
+    
+    torch.load = patched_load
+    try:
+        models, saved_cfg, task = checkpoint_utils.load_model_ensemble_and_task([model_path], suffix='', )
+    finally:
+        torch.load = original_load
     hubert = models[0]
     # HuBERT must always run on CPU with float32 — fairseq uses ops
     # unsupported on MPS, and float16 on CPU produces garbage.
@@ -108,7 +119,10 @@ def load_hubert(device, is_half, model_path):
 
 
 def get_vc(device, is_half, config, model_path):
-    cpt = torch.load(model_path, map_location='cpu')
+    try:
+        cpt = torch.load(model_path, map_location='cpu', weights_only=False)
+    except TypeError:
+        cpt = torch.load(model_path, map_location='cpu')
     if "config" not in cpt or "weight" not in cpt:
         raise ValueError(f'Incorrect format for {model_path}. Use a voice model trained using RVC v2 instead.')
 

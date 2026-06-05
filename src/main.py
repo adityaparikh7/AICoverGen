@@ -1,7 +1,6 @@
 import argparse
 import gc
 import hashlib
-import json
 import os
 
 # Ensure PyTorch falls back to CPU for unsupported MPS operations.
@@ -22,12 +21,18 @@ from pedalboard import Pedalboard, Reverb, Compressor, HighpassFilter
 from pedalboard.io import AudioFile
 from pydub import AudioSegment
 
-from mdx import run_mdx
 from rvc import Config, load_hubert, get_vc, rvc_infer
+from separator_models import (
+    DEFAULT_VOCAL_MODEL,
+    DEFAULT_KARAOKE_MODEL,
+    DEFAULT_DEREVERB_MODEL,
+    separate_vocals_instrumental,
+    separate_main_backup_vocals,
+    apply_dereverb,
+)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-mdxnet_models_dir = os.path.join(BASE_DIR, 'mdxnet_models')
 rvc_models_dir = os.path.join(BASE_DIR, 'rvc_models')
 output_dir = os.path.join(BASE_DIR, 'song_output')
 
@@ -167,7 +172,9 @@ def display_progress(message, percent, is_webui, progress=None):
         print(message)
 
 
-def preprocess_song(song_input, mdx_model_params, song_id, is_webui, input_type, progress=None):
+def preprocess_song(song_input, song_id, is_webui, input_type,
+                    vocal_model=None, karaoke_model=None, dereverb_model=None,
+                    progress=None):
     keep_orig = False
     if input_type == 'yt':
         display_progress('[~] Downloading song...', 0, is_webui, progress)
@@ -183,13 +190,19 @@ def preprocess_song(song_input, mdx_model_params, song_id, is_webui, input_type,
     orig_song_path = convert_to_stereo(orig_song_path)
 
     display_progress('[~] Separating Vocals from Instrumental...', 0.1, is_webui, progress)
-    vocals_path, instrumentals_path = run_mdx(mdx_model_params, song_output_dir, os.path.join(mdxnet_models_dir, 'UVR-MDX-NET-Voc_FT.onnx'), orig_song_path, denoise=True, keep_orig=keep_orig)
+    vocals_path, instrumentals_path = separate_vocals_instrumental(
+        orig_song_path, song_output_dir, model_display_name=vocal_model
+    )
 
     display_progress('[~] Separating Main Vocals from Backup Vocals...', 0.2, is_webui, progress)
-    backup_vocals_path, main_vocals_path = run_mdx(mdx_model_params, song_output_dir, os.path.join(mdxnet_models_dir, 'UVR_MDXNET_KARA_2.onnx'), vocals_path, suffix='Backup', invert_suffix='Main', denoise=True)
+    main_vocals_path, backup_vocals_path = separate_main_backup_vocals(
+        vocals_path, song_output_dir, model_display_name=karaoke_model
+    )
 
     display_progress('[~] Applying DeReverb to Vocals...', 0.3, is_webui, progress)
-    _, main_vocals_dereverb_path = run_mdx(mdx_model_params, song_output_dir, os.path.join(mdxnet_models_dir, 'Reverb_HQ_By_FoxJoy.onnx'), main_vocals_path, invert_suffix='DeReverb', exclude_main=True, denoise=True)
+    main_vocals_dereverb_path = apply_dereverb(
+        main_vocals_path, song_output_dir, model_display_name=dereverb_model
+    )
 
     return orig_song_path, vocals_path, instrumentals_path, main_vocals_path, backup_vocals_path, main_vocals_dereverb_path
 
@@ -247,15 +260,13 @@ def song_cover_pipeline(song_input, voice_model, pitch_change, keep_files,
                         is_webui=0, main_gain=0, backup_gain=0, inst_gain=0, index_rate=0.5, filter_radius=3,
                         rms_mix_rate=0.25, f0_method='rmvpe', crepe_hop_length=128, protect=0.33, pitch_change_all=0,
                         reverb_rm_size=0.15, reverb_wet=0.2, reverb_dry=0.8, reverb_damping=0.7, output_format='mp3',
+                        vocal_model=None, karaoke_model=None, dereverb_model=None,
                         progress=gr.Progress()):
     try:
         if not song_input or not voice_model:
             raise_exception('Ensure that the song input field and voice model field is filled.', is_webui)
 
         display_progress('[~] Starting AI Cover Generation Pipeline...', 0, is_webui, progress)
-
-        with open(os.path.join(mdxnet_models_dir, 'model_data.json')) as infile:
-            mdx_model_params = json.load(infile)
 
         # if youtube url
         if urlparse(song_input).scheme == 'https':
@@ -280,7 +291,11 @@ def song_cover_pipeline(song_input, voice_model, pitch_change, keep_files,
 
         if not os.path.exists(song_dir):
             os.makedirs(song_dir)
-            orig_song_path, vocals_path, instrumentals_path, main_vocals_path, backup_vocals_path, main_vocals_dereverb_path = preprocess_song(song_input, mdx_model_params, song_id, is_webui, input_type, progress)
+            orig_song_path, vocals_path, instrumentals_path, main_vocals_path, backup_vocals_path, main_vocals_dereverb_path = preprocess_song(
+                song_input, song_id, is_webui, input_type,
+                vocal_model=vocal_model, karaoke_model=karaoke_model, dereverb_model=dereverb_model,
+                progress=progress
+            )
 
         else:
             vocals_path, main_vocals_path = None, None
@@ -288,7 +303,11 @@ def song_cover_pipeline(song_input, voice_model, pitch_change, keep_files,
 
             # if any of the audio files aren't available or keep intermediate files, rerun preprocess
             if any(path is None for path in paths) or keep_files:
-                orig_song_path, vocals_path, instrumentals_path, main_vocals_path, backup_vocals_path, main_vocals_dereverb_path = preprocess_song(song_input, mdx_model_params, song_id, is_webui, input_type, progress)
+                orig_song_path, vocals_path, instrumentals_path, main_vocals_path, backup_vocals_path, main_vocals_dereverb_path = preprocess_song(
+                    song_input, song_id, is_webui, input_type,
+                    vocal_model=vocal_model, karaoke_model=karaoke_model, dereverb_model=dereverb_model,
+                    progress=progress
+                )
             else:
                 orig_song_path, instrumentals_path, main_vocals_dereverb_path, backup_vocals_path = paths
 

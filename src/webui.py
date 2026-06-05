@@ -8,10 +8,17 @@ from argparse import ArgumentParser
 import gradio as gr
 
 from main import song_cover_pipeline
+from separator_models import (
+    VOCAL_INSTRUMENTAL_MODELS,
+    KARAOKE_MODELS,
+    DEREVERB_MODELS,
+    DEFAULT_VOCAL_MODEL,
+    DEFAULT_KARAOKE_MODEL,
+    DEFAULT_DEREVERB_MODEL,
+)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-mdxnet_models_dir = os.path.join(BASE_DIR, 'mdxnet_models')
 rvc_models_dir = os.path.join(BASE_DIR, 'rvc_models')
 output_dir = os.path.join(BASE_DIR, 'song_output')
 
@@ -195,6 +202,31 @@ if __name__ == '__main__':
                     show_file_upload_button.click(swap_visibility, outputs=[file_upload_col, yt_link_col, song_input, local_file])
                     show_yt_link_button.click(swap_visibility, outputs=[yt_link_col, file_upload_col, song_input, local_file])
 
+            with gr.Accordion('Audio separation options', open=False):
+                gr.Markdown('### Stem Separation Models')
+                gr.Markdown('Choose which AI models to use for separating vocals from instrumentals. '
+                            'Better models produce cleaner stems but take longer. '
+                            'Models are auto-downloaded on first use to the `separation_models/` folder.')
+                with gr.Row():
+                    vocal_sep_model = gr.Dropdown(
+                        choices=list(VOCAL_INSTRUMENTAL_MODELS.keys()),
+                        value=DEFAULT_VOCAL_MODEL,
+                        label='Vocal / Instrumental Model',
+                        info='Separates vocals from instrumentals. BS-Roformer is state-of-the-art.'
+                    )
+                    karaoke_sep_model = gr.Dropdown(
+                        choices=list(KARAOKE_MODELS.keys()),
+                        value=DEFAULT_KARAOKE_MODEL,
+                        label='Main / Backup Vocals Model',
+                        info='Separates lead vocals from backing vocals.'
+                    )
+                    dereverb_sep_model = gr.Dropdown(
+                        choices=list(DEREVERB_MODELS.keys()),
+                        value=DEFAULT_DEREVERB_MODEL,
+                        label='De-Reverb Model',
+                        info='Removes reverb/echo from vocals before conversion. Select "None" to skip.'
+                    )
+
             with gr.Accordion('Voice conversion options', open=False):
                 with gr.Row():
                     index_rate = gr.Slider(0, 1, value=0.5, label='Index Rate', info="Controls how much of the AI voice's accent to keep in the vocals")
@@ -235,12 +267,14 @@ if __name__ == '__main__':
                                inputs=[song_input, rvc_model, pitch, keep_files, is_webui, main_gain, backup_gain,
                                        inst_gain, index_rate, filter_radius, rms_mix_rate, f0_method, crepe_hop_length,
                                        protect, pitch_all, reverb_rm_size, reverb_wet, reverb_dry, reverb_damping,
-                                       output_format],
+                                       output_format, vocal_sep_model, karaoke_sep_model, dereverb_sep_model],
                                outputs=[ai_cover])
-            clear_btn.click(lambda: [0, 0, 0, 0, 0.5, 3, 0.25, 0.33, 'rmvpe', 128, 0, 0.15, 0.2, 0.8, 0.7, 'mp3', None],
+            clear_btn.click(lambda: [0, 0, 0, 0, 0.5, 3, 0.25, 0.33, 'rmvpe', 128, 0, 0.15, 0.2, 0.8, 0.7, 'mp3',
+                                     DEFAULT_VOCAL_MODEL, DEFAULT_KARAOKE_MODEL, DEFAULT_DEREVERB_MODEL, None],
                             outputs=[pitch, main_gain, backup_gain, inst_gain, index_rate, filter_radius, rms_mix_rate,
                                      protect, f0_method, crepe_hop_length, pitch_all, reverb_rm_size, reverb_wet,
-                                     reverb_dry, reverb_damping, output_format, ai_cover])
+                                     reverb_dry, reverb_damping, output_format,
+                                     vocal_sep_model, karaoke_sep_model, dereverb_sep_model, ai_cover])
 
         # Download tab
         with gr.Tab('Download model'):
