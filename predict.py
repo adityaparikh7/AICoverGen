@@ -161,6 +161,30 @@ class Predictor(BasePredictor):
             default="mp3",
             choices=["mp3", "wav"],
         ),
+        enable_stem_separation: bool = Input(
+            description="Enable instrumental stem separation into drums, bass, guitar, piano, and other. Adds processing time.",
+            default=False,
+        ),
+        drums_volume_change: float = Input(
+            description="Volume change for drums stem in decibels (only when stem separation is enabled).",
+            default=0,
+        ),
+        bass_volume_change: float = Input(
+            description="Volume change for bass stem in decibels (only when stem separation is enabled).",
+            default=0,
+        ),
+        guitar_volume_change: float = Input(
+            description="Volume change for guitar stem in decibels (only when stem separation is enabled).",
+            default=0,
+        ),
+        piano_volume_change: float = Input(
+            description="Volume change for piano stem in decibels (only when stem separation is enabled).",
+            default=0,
+        ),
+        other_instruments_volume_change: float = Input(
+            description="Volume change for other instruments stem in decibels (only when stem separation is enabled).",
+            default=0,
+        ),
     ) -> CogPath:
         """
         Runs a single prediction on the model.
@@ -241,6 +265,12 @@ class Predictor(BasePredictor):
             reverb_dryness=reverb_dryness,
             reverb_damping=reverb_damping,
             output_format=output_format,
+            stem_model='HTDemucs 6-Stem (Best)' if enable_stem_separation else None,
+            drums_vol=drums_volume_change,
+            bass_vol=bass_volume_change,
+            guitar_vol=guitar_volume_change,
+            piano_vol=piano_volume_change,
+            other_inst_vol=other_instruments_volume_change,
         )
 
         rvc_dirname = args.rvc_dirname
@@ -269,6 +299,12 @@ class Predictor(BasePredictor):
             reverb_dry=args.reverb_dryness,
             reverb_damping=args.reverb_damping,
             output_format=args.output_format,
+            stem_model=args.stem_model,
+            drums_gain=args.drums_vol,
+            bass_gain=args.bass_vol,
+            guitar_gain=args.guitar_vol,
+            piano_gain=args.piano_vol,
+            other_inst_gain=args.other_inst_vol,
         )
         print(f"[+] Cover generated at {cover_path}")
 

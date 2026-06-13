@@ -23,12 +23,15 @@ from separator_models import (
     VOCAL_INSTRUMENTAL_MODELS,
     KARAOKE_MODELS,
     DEREVERB_MODELS,
+    INSTRUMENTAL_STEM_MODELS,
     DEFAULT_VOCAL_MODEL,
     DEFAULT_KARAOKE_MODEL,
     DEFAULT_DEREVERB_MODEL,
+    DEFAULT_STEM_MODEL,
     separate_vocals_instrumental,
     separate_main_backup_vocals,
     apply_dereverb,
+    separate_instrumental_stems,
 )
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -40,8 +43,10 @@ output_dir = os.path.join(BASE_DIR, 'song_output')
 # Audio Splitter helpers
 # ---------------------------------------------------------------------------
 
-def split_audio_webui(input_audio, vocal_model, karaoke_model, dereverb_model):
-    """Split audio into instrumental, backup vocals, main vocals, and de-reverbed main vocals."""
+def split_audio_webui(input_audio, vocal_model, karaoke_model, dereverb_model,
+                      enable_stems, stem_model):
+    """Split audio into instrumental, backup vocals, main vocals, and de-reverbed main vocals.
+    Optionally split instrumental into individual stems."""
     if input_audio is None:
         raise gr.Error("Please upload an audio file.")
 
@@ -69,7 +74,67 @@ def split_audio_webui(input_audio, vocal_model, karaoke_model, dereverb_model):
         main_vocals_path, out_folder, model_display_name=dereverb_model
     )
 
-    return instrumentals_path, backup_vocals_path, main_vocals_path, main_vocals_dereverb_path
+    # Step 4 (optional): Split instrumental into stems
+    stems_result = {"drums": None, "bass": None, "guitar": None, "piano": None, "other": None}
+    if enable_stems and stem_model:
+        raw_stems = separate_instrumental_stems(
+            instrumentals_path, out_folder, model_display_name=stem_model
+        )
+        # Rename stem files with standardized names
+        for stem_name, src_path in raw_stems.items():
+            if stem_name == 'vocal_remnants':
+                dst_name = f'{base_name}_Stem_Vocal_Remnants.wav'
+            else:
+                dst_name = f'{base_name}_Stem_{stem_name.capitalize()}.wav'
+            dst_path = os.path.join(out_folder, dst_name)
+            if src_path != dst_path and os.path.exists(src_path):
+                os.rename(src_path, dst_path)
+            stems_result[stem_name] = dst_path
+
+    return (
+        instrumentals_path, backup_vocals_path, main_vocals_path, main_vocals_dereverb_path,
+        stems_result.get("drums"), stems_result.get("bass"),
+        stems_result.get("guitar"), stems_result.get("piano"),
+        stems_result.get("other"),
+    )
+
+
+def stem_separator_webui(input_audio, stem_model):
+    """Split an instrumental audio file into individual stems directly."""
+    if input_audio is None:
+        raise gr.Error("Please upload an audio file.")
+
+    input_path = input_audio
+    if hasattr(input_audio, "name"):
+        input_path = input_audio.name
+
+    # Prepare output folder
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    out_folder = os.path.join(output_dir, f"{base_name}_stems_only")
+    os.makedirs(out_folder, exist_ok=True)
+
+    stems_result = {"drums": None, "bass": None, "guitar": None, "piano": None, "other": None, "vocal_remnants": None}
+    
+    raw_stems = separate_instrumental_stems(
+        input_path, out_folder, model_display_name=stem_model
+    )
+    
+    # Rename stem files with standardized names
+    for stem_name, src_path in raw_stems.items():
+        if stem_name == 'vocal_remnants':
+            dst_name = f'{base_name}_Stem_Vocal_Remnants.wav'
+        else:
+            dst_name = f'{base_name}_Stem_{stem_name.capitalize()}.wav'
+        dst_path = os.path.join(out_folder, dst_name)
+        if src_path != dst_path and os.path.exists(src_path):
+            os.rename(src_path, dst_path)
+        stems_result[stem_name] = dst_path
+
+    return (
+        stems_result.get("drums"), stems_result.get("bass"),
+        stems_result.get("guitar"), stems_result.get("piano"),
+        stems_result.get("other"), stems_result.get("vocal_remnants")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +223,15 @@ def show_crepe_slider(method):
     return gr.update(visible=method == 'mangio-crepe')
 
 
+def toggle_stem_controls(enable):
+    """Show/hide stem-related UI elements."""
+    return (
+        gr.update(visible=enable),  # stem_model_dropdown
+        gr.update(visible=enable),  # stem_outputs_row_1
+        gr.update(visible=enable),  # stem_outputs_row_2
+    )
+
+
 # ---------------------------------------------------------------------------
 # Build the Gradio app
 # ---------------------------------------------------------------------------
@@ -201,6 +275,25 @@ with gr.Blocks(title='AI Audio Tools') as app:
                     info='Removes reverb/echo from vocals. Select "None" to skip.'
                 )
 
+        with gr.Accordion("Instrumental Stem Separation", open=False):
+            gr.Markdown(
+                'Optionally split the instrumental into individual stems: drums, bass, guitar, piano, and other. '
+                'Uses Meta\'s HTDemucs model. Adds significant processing time.'
+            )
+            with gr.Row():
+                enable_stems_cb = gr.Checkbox(
+                    label='Enable Instrumental Stem Separation',
+                    value=False,
+                    info='Split instrumental into drums, bass, guitar, piano, and other.'
+                )
+                stem_model_dropdown = gr.Dropdown(
+                    choices=list(INSTRUMENTAL_STEM_MODELS.keys()),
+                    value=DEFAULT_STEM_MODEL,
+                    label='Stem Separation Model',
+                    info='HTDemucs 6-Stem separates guitar and piano. 4-Stem models are faster.',
+                    visible=False,
+                )
+
         with gr.Row():
             split_btn = gr.Button("Split Audio", variant="primary")
 
@@ -211,10 +304,23 @@ with gr.Blocks(title='AI Audio Tools') as app:
             main_vocals_out = gr.Audio(label="Main Vocals", interactive=False)
             main_vocals_dereverb_out = gr.Audio(label="Main Vocals (De-Reverbed)", interactive=False)
 
+        with gr.Row(visible=False) as stem_outputs_row_1:
+            drums_out = gr.Audio(label="🥁 Drums", interactive=False)
+            bass_out = gr.Audio(label="🎸 Bass", interactive=False)
+            guitar_out = gr.Audio(label="🎸 Guitar", interactive=False)
+        with gr.Row(visible=False) as stem_outputs_row_2:
+            piano_out = gr.Audio(label="🎹 Piano", interactive=False)
+            other_out = gr.Audio(label="🎵 Other", interactive=False)
+
+        enable_stems_cb.change(toggle_stem_controls, inputs=enable_stems_cb,
+                               outputs=[stem_model_dropdown, stem_outputs_row_1, stem_outputs_row_2])
+
         split_btn.click(
             split_audio_webui,
-            inputs=[audio_in, vocal_model_dropdown, karaoke_model_dropdown, dereverb_model_dropdown],
-            outputs=[instrumental_out, backup_vocals_out, main_vocals_out, main_vocals_dereverb_out]
+            inputs=[audio_in, vocal_model_dropdown, karaoke_model_dropdown, dereverb_model_dropdown,
+                    enable_stems_cb, stem_model_dropdown],
+            outputs=[instrumental_out, backup_vocals_out, main_vocals_out, main_vocals_dereverb_out,
+                     drums_out, bass_out, guitar_out, piano_out, other_out]
         )
 
     # === Tab 2: Voice Conversion ===
@@ -285,6 +391,39 @@ with gr.Blocks(title='AI Audio Tools') as app:
                 filter_radius, rms_mix_rate, protect, f0_method, crepe_hop_length
             ],
             outputs=vc_output_audio
+        )
+
+    # === Tab 3: Stem Separator ===
+    with gr.Tab("🥁 Stem Separator"):
+        gr.Markdown('Upload any instrumental audio file to split it into individual instrument stems using Meta HTDemucs.')
+
+        with gr.Row():
+            stem_audio_in = gr.Audio(label="Upload Instrumental Audio", type="filepath")
+
+        with gr.Row():
+            solo_stem_model_dropdown = gr.Dropdown(
+                choices=list(INSTRUMENTAL_STEM_MODELS.keys()),
+                value=DEFAULT_STEM_MODEL,
+                label='Stem Separation Model',
+                info='HTDemucs 6-Stem separates guitar and piano. 4-Stem models are faster.'
+            )
+
+        with gr.Row():
+            separate_stems_btn = gr.Button("Separate Stems", variant="primary")
+
+        with gr.Row():
+            solo_drums_out = gr.Audio(label="🥁 Drums", interactive=False)
+            solo_bass_out = gr.Audio(label="🎸 Bass", interactive=False)
+            solo_guitar_out = gr.Audio(label="🎸 Guitar", interactive=False)
+        with gr.Row():
+            solo_piano_out = gr.Audio(label="🎹 Piano", interactive=False)
+            solo_other_out = gr.Audio(label="🎵 Other", interactive=False)
+            solo_vocal_remnants_out = gr.Audio(label="🎤 Vocal Remnants", interactive=False)
+
+        separate_stems_btn.click(
+            stem_separator_webui,
+            inputs=[stem_audio_in, solo_stem_model_dropdown],
+            outputs=[solo_drums_out, solo_bass_out, solo_guitar_out, solo_piano_out, solo_other_out, solo_vocal_remnants_out]
         )
 
 

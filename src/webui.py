@@ -12,9 +12,11 @@ from separator_models import (
     VOCAL_INSTRUMENTAL_MODELS,
     KARAOKE_MODELS,
     DEREVERB_MODELS,
+    INSTRUMENTAL_STEM_MODELS,
     DEFAULT_VOCAL_MODEL,
     DEFAULT_KARAOKE_MODEL,
     DEFAULT_DEREVERB_MODEL,
+    DEFAULT_STEM_MODEL,
 )
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -161,6 +163,15 @@ def show_hop_slider(pitch_detection_algo):
         return gr.update(visible=False)
 
 
+def toggle_stem_ui(enable_stems):
+    """Show/hide stem-related UI elements based on the enable checkbox."""
+    return (
+        gr.update(visible=enable_stems),  # stem_sep_model
+        gr.update(visible=enable_stems),  # stem_volume_row
+        gr.update(visible=not enable_stems),  # inst_gain (hide when stems enabled)
+    )
+
+
 if __name__ == '__main__':
     parser = ArgumentParser(description='Generate a AI cover song in the song_output/id directory.', add_help=True)
     parser.add_argument("--share", action="store_true", dest="share_enabled", default=False, help="Enable sharing")
@@ -227,6 +238,21 @@ if __name__ == '__main__':
                         info='Removes reverb/echo from vocals before conversion. Select "None" to skip.'
                     )
 
+                gr.Markdown('### Instrumental Stem Separation')
+                with gr.Row():
+                    enable_stems = gr.Checkbox(
+                        label='Enable Instrumental Stem Separation',
+                        value=False,
+                        info='Split instrumental into drums, bass, guitar, piano, and other. Adds processing time.'
+                    )
+                    stem_sep_model = gr.Dropdown(
+                        choices=list(INSTRUMENTAL_STEM_MODELS.keys()),
+                        value=DEFAULT_STEM_MODEL,
+                        label='Stem Separation Model',
+                        info='HTDemucs 6-Stem separates guitar and piano. 4-Stem models are faster.',
+                        visible=False,
+                    )
+
             with gr.Accordion('Voice conversion options', open=False):
                 with gr.Row():
                     index_rate = gr.Slider(0, 1, value=0.5, label='Index Rate', info="Controls how much of the AI voice's accent to keep in the vocals")
@@ -246,6 +272,16 @@ if __name__ == '__main__':
                     backup_gain = gr.Slider(-20, 20, value=0, step=1, label='Backup Vocals')
                     inst_gain = gr.Slider(-20, 20, value=0, step=1, label='Music')
 
+                with gr.Row(visible=False) as stem_volume_row:
+                    drums_gain = gr.Slider(-20, 20, value=0, step=1, label='🥁 Drums')
+                    bass_gain = gr.Slider(-20, 20, value=0, step=1, label='🎸 Bass')
+                    guitar_gain = gr.Slider(-20, 20, value=0, step=1, label='🎸 Guitar')
+                    piano_gain = gr.Slider(-20, 20, value=0, step=1, label='🎹 Piano')
+                    other_inst_gain = gr.Slider(-20, 20, value=0, step=1, label='🎵 Other')
+
+                enable_stems.change(toggle_stem_ui, inputs=enable_stems,
+                                    outputs=[stem_sep_model, stem_volume_row, inst_gain])
+
                 gr.Markdown('### Reverb Control on AI Vocals')
                 with gr.Row():
                     reverb_rm_size = gr.Slider(0, 1, value=0.15, label='Room size', info='The larger the room, the longer the reverb time')
@@ -263,18 +299,30 @@ if __name__ == '__main__':
 
             ref_btn.click(update_models_list, None, outputs=rvc_model)
             is_webui = gr.Number(value=1, visible=False)
+            # Convert enable_stems checkbox to stem_model string (None when disabled)
+            stem_model_state = gr.State(value=None)
+            def resolve_stem_model(enable, model_name):
+                return model_name if enable else None
+
+            enable_stems.change(resolve_stem_model, inputs=[enable_stems, stem_sep_model], outputs=stem_model_state)
+            stem_sep_model.change(resolve_stem_model, inputs=[enable_stems, stem_sep_model], outputs=stem_model_state)
+
             generate_btn.click(song_cover_pipeline,
                                inputs=[song_input, rvc_model, pitch, keep_files, is_webui, main_gain, backup_gain,
-                                       inst_gain, index_rate, filter_radius, rms_mix_rate, f0_method, crepe_hop_length,
-                                       protect, pitch_all, reverb_rm_size, reverb_wet, reverb_dry, reverb_damping,
-                                       output_format, vocal_sep_model, karaoke_sep_model, dereverb_sep_model],
+                                        inst_gain, index_rate, filter_radius, rms_mix_rate, f0_method, crepe_hop_length,
+                                        protect, pitch_all, reverb_rm_size, reverb_wet, reverb_dry, reverb_damping,
+                                        output_format, vocal_sep_model, karaoke_sep_model, dereverb_sep_model,
+                                        stem_model_state, drums_gain, bass_gain, guitar_gain, piano_gain, other_inst_gain],
                                outputs=[ai_cover])
             clear_btn.click(lambda: [0, 0, 0, 0, 0.5, 3, 0.25, 0.33, 'rmvpe', 128, 0, 0.15, 0.2, 0.8, 0.7, 'mp3',
-                                     DEFAULT_VOCAL_MODEL, DEFAULT_KARAOKE_MODEL, DEFAULT_DEREVERB_MODEL, None],
+                                     DEFAULT_VOCAL_MODEL, DEFAULT_KARAOKE_MODEL, DEFAULT_DEREVERB_MODEL,
+                                     False, DEFAULT_STEM_MODEL, 0, 0, 0, 0, 0, None, None],
                             outputs=[pitch, main_gain, backup_gain, inst_gain, index_rate, filter_radius, rms_mix_rate,
                                      protect, f0_method, crepe_hop_length, pitch_all, reverb_rm_size, reverb_wet,
                                      reverb_dry, reverb_damping, output_format,
-                                     vocal_sep_model, karaoke_sep_model, dereverb_sep_model, ai_cover])
+                                     vocal_sep_model, karaoke_sep_model, dereverb_sep_model,
+                                     enable_stems, stem_sep_model, drums_gain, bass_gain, guitar_gain, piano_gain,
+                                     other_inst_gain, stem_model_state, ai_cover])
 
         # Download tab
         with gr.Tab('Download model'):

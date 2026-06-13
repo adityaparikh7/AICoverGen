@@ -26,9 +26,13 @@ from separator_models import (
     DEFAULT_VOCAL_MODEL,
     DEFAULT_KARAOKE_MODEL,
     DEFAULT_DEREVERB_MODEL,
+    DEFAULT_STEM_MODEL,
+    STEM_NAMES_6S,
+    STEM_NAMES_4S,
     separate_vocals_instrumental,
     separate_main_backup_vocals,
     apply_dereverb,
+    separate_instrumental_stems,
 )
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -116,6 +120,7 @@ def get_audio_paths(song_dir):
     instrumentals_path = None
     main_vocals_dereverb_path = None
     backup_vocals_path = None
+    stem_paths = {}
 
     for file in os.listdir(song_dir):
         if file.endswith('_Instrumental.wav'):
@@ -128,7 +133,20 @@ def get_audio_paths(song_dir):
         elif file.endswith('_Vocals_Backup.wav'):
             backup_vocals_path = os.path.join(song_dir, file)
 
-    return orig_song_path, instrumentals_path, main_vocals_dereverb_path, backup_vocals_path
+        elif file.endswith('_Stem_Drums.wav'):
+            stem_paths['drums'] = os.path.join(song_dir, file)
+        elif file.endswith('_Stem_Bass.wav'):
+            stem_paths['bass'] = os.path.join(song_dir, file)
+        elif file.endswith('_Stem_Guitar.wav'):
+            stem_paths['guitar'] = os.path.join(song_dir, file)
+        elif file.endswith('_Stem_Piano.wav'):
+            stem_paths['piano'] = os.path.join(song_dir, file)
+        elif file.endswith('_Stem_Other.wav'):
+            stem_paths['other'] = os.path.join(song_dir, file)
+        elif file.endswith('_Stem_Vocal_Remnants.wav'):
+            stem_paths['vocal_remnants'] = os.path.join(song_dir, file)
+
+    return orig_song_path, instrumentals_path, main_vocals_dereverb_path, backup_vocals_path, stem_paths
 
 
 def convert_to_stereo(audio_path):
@@ -174,7 +192,7 @@ def display_progress(message, percent, is_webui, progress=None):
 
 def preprocess_song(song_input, song_id, is_webui, input_type,
                     vocal_model=None, karaoke_model=None, dereverb_model=None,
-                    progress=None):
+                    stem_model=None, progress=None):
     keep_orig = False
     if input_type == 'yt':
         display_progress('[~] Downloading song...', 0, is_webui, progress)
@@ -204,7 +222,26 @@ def preprocess_song(song_input, song_id, is_webui, input_type,
         main_vocals_path, song_output_dir, model_display_name=dereverb_model
     )
 
-    return orig_song_path, vocals_path, instrumentals_path, main_vocals_path, backup_vocals_path, main_vocals_dereverb_path
+    # Optional: separate instrumental into individual stems
+    stem_paths = {}
+    if stem_model is not None:
+        display_progress('[~] Separating Instrumental into Stems (drums, bass, guitar, piano)...', 0.4, is_webui, progress)
+        raw_stems = separate_instrumental_stems(
+            instrumentals_path, song_output_dir, model_display_name=stem_model
+        )
+        # Rename stem files with standardized suffixes for caching
+        base_name = os.path.splitext(os.path.basename(orig_song_path))[0]
+        for stem_name, src_path in raw_stems.items():
+            if stem_name == 'vocal_remnants':
+                dst_name = f'{base_name}_Stem_Vocal_Remnants.wav'
+            else:
+                dst_name = f'{base_name}_Stem_{stem_name.capitalize()}.wav'
+            dst_path = os.path.join(song_output_dir, dst_name)
+            if src_path != dst_path and os.path.exists(src_path):
+                os.rename(src_path, dst_path)
+            stem_paths[stem_name] = dst_path
+
+    return orig_song_path, vocals_path, instrumentals_path, main_vocals_path, backup_vocals_path, main_vocals_dereverb_path, stem_paths
 
 
 def voice_change(voice_model, vocals_path, output_path, pitch_change, f0_method, index_rate, filter_radius, rms_mix_rate, protect, crepe_hop_length, is_webui):
@@ -249,10 +286,32 @@ def add_audio_effects(audio_path, reverb_rm_size, reverb_wet, reverb_dry, reverb
     return output_path
 
 
-def combine_audio(audio_paths, output_path, main_gain, backup_gain, inst_gain, output_format):
+def combine_audio(audio_paths, output_path, main_gain, backup_gain, inst_gain, output_format, stem_gains=None):
     main_vocal_audio = AudioSegment.from_wav(audio_paths[0]) - 4 + main_gain
     backup_vocal_audio = AudioSegment.from_wav(audio_paths[1]) - 6 + backup_gain
-    instrumental_audio = AudioSegment.from_wav(audio_paths[2]) - 7 + inst_gain
+
+    if stem_gains and isinstance(audio_paths[2], dict):
+        # Stem-aware mixing: audio_paths[2] is a dict of stem_name -> file_path
+        stem_paths = audio_paths[2]
+        instrumental_audio = None
+        for stem_name, stem_path in stem_paths.items():
+            if stem_name == 'vocal_remnants':
+                continue  # Don't mix vocal remnants into the output
+            if not os.path.exists(stem_path):
+                continue
+            gain = stem_gains.get(stem_name, 0)
+            stem_audio = AudioSegment.from_wav(stem_path) - 7 + gain
+            if instrumental_audio is None:
+                instrumental_audio = stem_audio
+            else:
+                instrumental_audio = instrumental_audio.overlay(stem_audio)
+        if instrumental_audio is None:
+            # Fallback: silence
+            instrumental_audio = AudioSegment.silent(duration=len(main_vocal_audio))
+    else:
+        # Legacy mode: single instrumental file
+        instrumental_audio = AudioSegment.from_wav(audio_paths[2]) - 7 + inst_gain
+
     main_vocal_audio.overlay(backup_vocal_audio).overlay(instrumental_audio).export(output_path, format=output_format)
 
 
@@ -261,6 +320,7 @@ def song_cover_pipeline(song_input, voice_model, pitch_change, keep_files,
                         rms_mix_rate=0.25, f0_method='rmvpe', crepe_hop_length=128, protect=0.33, pitch_change_all=0,
                         reverb_rm_size=0.15, reverb_wet=0.2, reverb_dry=0.8, reverb_damping=0.7, output_format='mp3',
                         vocal_model=None, karaoke_model=None, dereverb_model=None,
+                        stem_model=None, drums_gain=0, bass_gain=0, guitar_gain=0, piano_gain=0, other_inst_gain=0,
                         progress=gr.Progress()):
     try:
         if not song_input or not voice_model:
@@ -288,12 +348,14 @@ def song_cover_pipeline(song_input, voice_model, pitch_change, keep_files,
                 raise_exception(error_msg, is_webui)
 
         song_dir = os.path.join(output_dir, song_id)
+        stem_paths = {}
 
         if not os.path.exists(song_dir):
             os.makedirs(song_dir)
-            orig_song_path, vocals_path, instrumentals_path, main_vocals_path, backup_vocals_path, main_vocals_dereverb_path = preprocess_song(
+            orig_song_path, vocals_path, instrumentals_path, main_vocals_path, backup_vocals_path, main_vocals_dereverb_path, stem_paths = preprocess_song(
                 song_input, song_id, is_webui, input_type,
                 vocal_model=vocal_model, karaoke_model=karaoke_model, dereverb_model=dereverb_model,
+                stem_model=stem_model,
                 progress=progress
             )
 
@@ -301,15 +363,32 @@ def song_cover_pipeline(song_input, voice_model, pitch_change, keep_files,
             vocals_path, main_vocals_path = None, None
             paths = get_audio_paths(song_dir)
 
-            # if any of the audio files aren't available or keep intermediate files, rerun preprocess
-            if any(path is None for path in paths) or keep_files:
-                orig_song_path, vocals_path, instrumentals_path, main_vocals_path, backup_vocals_path, main_vocals_dereverb_path = preprocess_song(
+            # if any of the core audio files aren't available or keep intermediate files, rerun preprocess
+            if any(path is None for path in paths[:4]) or keep_files:
+                orig_song_path, vocals_path, instrumentals_path, main_vocals_path, backup_vocals_path, main_vocals_dereverb_path, stem_paths = preprocess_song(
                     song_input, song_id, is_webui, input_type,
                     vocal_model=vocal_model, karaoke_model=karaoke_model, dereverb_model=dereverb_model,
+                    stem_model=stem_model,
                     progress=progress
                 )
             else:
-                orig_song_path, instrumentals_path, main_vocals_dereverb_path, backup_vocals_path = paths
+                orig_song_path, instrumentals_path, main_vocals_dereverb_path, backup_vocals_path, stem_paths = paths
+                # If stems were requested but not cached, run stem separation only
+                if stem_model and not stem_paths:
+                    display_progress('[~] Separating Instrumental into Stems...', 0.4, is_webui, progress)
+                    raw_stems = separate_instrumental_stems(
+                        instrumentals_path, song_dir, model_display_name=stem_model
+                    )
+                    base_name = os.path.splitext(os.path.basename(orig_song_path))[0]
+                    for stem_name, src_path in raw_stems.items():
+                        if stem_name == 'vocal_remnants':
+                            dst_name = f'{base_name}_Stem_Vocal_Remnants.wav'
+                        else:
+                            dst_name = f'{base_name}_Stem_{stem_name.capitalize()}.wav'
+                        dst_path = os.path.join(song_dir, dst_name)
+                        if src_path != dst_path and os.path.exists(src_path):
+                            os.rename(src_path, dst_path)
+                        stem_paths[stem_name] = dst_path
 
         pitch_change = pitch_change * 12 + pitch_change_all
         ai_vocals_path = os.path.join(song_dir, f'{os.path.splitext(os.path.basename(orig_song_path))[0]}_{voice_model}_p{pitch_change}_i{index_rate}_fr{filter_radius}_rms{rms_mix_rate}_pro{protect}_{f0_method}{"" if f0_method != "mangio-crepe" else f"_{crepe_hop_length}"}.wav')
@@ -324,17 +403,36 @@ def song_cover_pipeline(song_input, voice_model, pitch_change, keep_files,
 
         if pitch_change_all != 0:
             display_progress('[~] Applying overall pitch change', 0.85, is_webui, progress)
-            instrumentals_path = pitch_shift(instrumentals_path, pitch_change_all)
+            if stem_paths and stem_model:
+                # Apply pitch shift to each stem individually
+                for stem_name in list(stem_paths.keys()):
+                    if stem_name == 'vocal_remnants':
+                        continue
+                    stem_paths[stem_name] = pitch_shift(stem_paths[stem_name], pitch_change_all)
+            else:
+                instrumentals_path = pitch_shift(instrumentals_path, pitch_change_all)
             backup_vocals_path = pitch_shift(backup_vocals_path, pitch_change_all)
 
         display_progress('[~] Combining AI Vocals and Instrumentals...', 0.9, is_webui, progress)
-        combine_audio([ai_vocals_mixed_path, backup_vocals_path, instrumentals_path], ai_cover_path, main_gain, backup_gain, inst_gain, output_format)
+        if stem_paths and stem_model:
+            stem_gains = {
+                'drums': drums_gain,
+                'bass': bass_gain,
+                'guitar': guitar_gain,
+                'piano': piano_gain,
+                'other': other_inst_gain,
+            }
+            combine_audio([ai_vocals_mixed_path, backup_vocals_path, stem_paths], ai_cover_path, main_gain, backup_gain, inst_gain, output_format, stem_gains=stem_gains)
+        else:
+            combine_audio([ai_vocals_mixed_path, backup_vocals_path, instrumentals_path], ai_cover_path, main_gain, backup_gain, inst_gain, output_format)
 
         if not keep_files:
             display_progress('[~] Removing intermediate audio files...', 0.95, is_webui, progress)
             intermediate_files = [vocals_path, main_vocals_path, ai_vocals_mixed_path]
             if pitch_change_all != 0:
-                intermediate_files += [instrumentals_path, backup_vocals_path]
+                if not (stem_paths and stem_model):
+                    intermediate_files.append(instrumentals_path)
+                intermediate_files.append(backup_vocals_path)
             for file in intermediate_files:
                 if file and os.path.exists(file):
                     os.remove(file)
@@ -366,11 +464,22 @@ if __name__ == '__main__':
     parser.add_argument('-rdry', '--reverb-dryness', type=float, default=0.8, help='Reverb dry level between 0 and 1')
     parser.add_argument('-rdamp', '--reverb-damping', type=float, default=0.7, help='Reverb damping between 0 and 1')
     parser.add_argument('-oformat', '--output-format', type=str, default='mp3', help='Output format of audio file. mp3 for smaller file size, wav for best quality')
+    parser.add_argument('--enable-stems', action='store_true', default=False, help='Enable instrumental stem separation into drums, bass, guitar, piano, and other')
+    parser.add_argument('--stem-model', type=str, default=None, help='Stem separation model display name. Default: HTDemucs 6-Stem (Best)')
+    parser.add_argument('--drums-vol', type=int, default=0, help='Volume change for drums stem in decibels')
+    parser.add_argument('--bass-vol', type=int, default=0, help='Volume change for bass stem in decibels')
+    parser.add_argument('--guitar-vol', type=int, default=0, help='Volume change for guitar stem in decibels')
+    parser.add_argument('--piano-vol', type=int, default=0, help='Volume change for piano stem in decibels')
+    parser.add_argument('--other-inst-vol', type=int, default=0, help='Volume change for other instruments stem in decibels')
     args = parser.parse_args()
 
     rvc_dirname = args.rvc_dirname
     if not os.path.exists(os.path.join(rvc_models_dir, rvc_dirname)):
         raise Exception(f'The folder {os.path.join(rvc_models_dir, rvc_dirname)} does not exist.')
+
+    stem_model_arg = args.stem_model if args.enable_stems else None
+    if args.enable_stems and stem_model_arg is None:
+        stem_model_arg = DEFAULT_STEM_MODEL
 
     cover_path = song_cover_pipeline(args.song_input, rvc_dirname, args.pitch_change, args.keep_files,
                                      main_gain=args.main_vol, backup_gain=args.backup_vol, inst_gain=args.inst_vol,
@@ -380,5 +489,10 @@ if __name__ == '__main__':
                                      pitch_change_all=args.pitch_change_all,
                                      reverb_rm_size=args.reverb_size, reverb_wet=args.reverb_wetness,
                                      reverb_dry=args.reverb_dryness, reverb_damping=args.reverb_damping,
-                                     output_format=args.output_format)
+                                     output_format=args.output_format,
+                                     stem_model=stem_model_arg,
+                                     drums_gain=args.drums_vol, bass_gain=args.bass_vol,
+                                     guitar_gain=args.guitar_vol, piano_gain=args.piano_vol,
+                                     other_inst_gain=args.other_inst_vol)
     print(f'[+] Cover generated at {cover_path}')
+

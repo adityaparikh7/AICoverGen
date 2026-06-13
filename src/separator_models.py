@@ -37,10 +37,21 @@ DEREVERB_MODELS = {
     "None (Skip)": None,
 }
 
+INSTRUMENTAL_STEM_MODELS = {
+    "HTDemucs 6-Stem (Best)": "htdemucs_6s.yaml",
+    "HTDemucs Fine-Tuned 4-Stem": "htdemucs_ft.yaml",
+    "HTDemucs Standard 4-Stem (Fast)": "htdemucs.yaml",
+}
+
+# Stem names output by each model type
+STEM_NAMES_6S = ["drums", "bass", "guitar", "piano", "other"]
+STEM_NAMES_4S = ["drums", "bass", "other"]
+
 # Convenience: default display-name keys
 DEFAULT_VOCAL_MODEL = list(VOCAL_INSTRUMENTAL_MODELS.keys())[0]
 DEFAULT_KARAOKE_MODEL = list(KARAOKE_MODELS.keys())[0]
 DEFAULT_DEREVERB_MODEL = list(DEREVERB_MODELS.keys())[0]
+DEFAULT_STEM_MODEL = list(INSTRUMENTAL_STEM_MODELS.keys())[0]
 
 
 def _resolve_model_filename(display_name, catalog):
@@ -196,3 +207,65 @@ def apply_dereverb(vocals_path, output_dir, model_display_name=None, denoise=Tru
         dereverbed_path = output_files[1] if len(output_files) > 1 else output_files[0]
 
     return dereverbed_path
+
+
+def separate_instrumental_stems(instrumental_path, output_dir, model_display_name=None):
+    """
+    Separate an instrumental track into individual instrument stems.
+
+    Uses Demucs models via audio-separator to split the instrumental into
+    drums, bass, guitar, piano, other, and vocal remnants.
+
+    Args:
+        instrumental_path: Path to the instrumental WAV file.
+        output_dir: Directory to write output stem files.
+        model_display_name: Display name from INSTRUMENTAL_STEM_MODELS catalog.
+
+    Returns:
+        dict: Mapping of stem name to file path, e.g.
+              {"drums": "/path/drums.wav", "bass": ..., "vocal_remnants": ...}
+    """
+    if model_display_name is None:
+        model_display_name = DEFAULT_STEM_MODEL
+    model_filename = _resolve_model_filename(model_display_name, INSTRUMENTAL_STEM_MODELS)
+
+    # Determine which stems this model produces
+    is_6s = '6s' in model_filename if model_filename else False
+    expected_stems = STEM_NAMES_6S if is_6s else STEM_NAMES_4S
+
+    output_files = separate_audio(instrumental_path, output_dir, model_filename)
+
+    # Map output files to stem names based on filename contents
+    stem_paths = {}
+    unmatched = []
+    for f in output_files:
+        f_lower = os.path.basename(f).lower()
+        matched = False
+        if 'drum' in f_lower:
+            stem_paths['drums'] = f
+            matched = True
+        elif 'bass' in f_lower:
+            stem_paths['bass'] = f
+            matched = True
+        elif 'guitar' in f_lower:
+            stem_paths['guitar'] = f
+            matched = True
+        elif 'piano' in f_lower:
+            stem_paths['piano'] = f
+            matched = True
+        elif 'vocal' in f_lower:
+            # Vocal remnants from instrumental — save as labeled file
+            stem_paths['vocal_remnants'] = f
+            matched = True
+        elif 'other' in f_lower or 'no_' not in f_lower:
+            stem_paths['other'] = f
+            matched = True
+
+        if not matched:
+            unmatched.append(f)
+
+    # Assign any unmatched files to 'other' if not already set
+    if 'other' not in stem_paths and unmatched:
+        stem_paths['other'] = unmatched.pop(0)
+
+    return stem_paths
