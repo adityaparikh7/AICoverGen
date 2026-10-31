@@ -5,6 +5,7 @@ from rvc import Config, load_hubert, get_vc, rvc_infer
 
 # Ensure PyTorch falls back to CPU for unsupported MPS operations.
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 rvc_models_dir = os.path.join(BASE_DIR, 'rvc_models')
