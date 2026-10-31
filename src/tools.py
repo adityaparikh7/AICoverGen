@@ -61,35 +61,25 @@ def split_audio_webui(input_audio, vocal_model, karaoke_model, dereverb_model,
 
     # Step 1: Vocals / Instrumental separation
     vocals_path, instrumentals_path = separate_vocals_instrumental(
-        input_path, out_folder, model_display_name=vocal_model
+        input_path, out_folder, model_display_name=vocal_model, base_name=base_name
     )
 
     # Step 2: Main / Backup vocals split
     main_vocals_path, backup_vocals_path = separate_main_backup_vocals(
-        vocals_path, out_folder, model_display_name=karaoke_model
+        vocals_path, out_folder, model_display_name=karaoke_model, base_name=base_name
     )
 
     # Step 3: De-reverb on main vocals
     main_vocals_dereverb_path = apply_dereverb(
-        main_vocals_path, out_folder, model_display_name=dereverb_model
+        main_vocals_path, out_folder, model_display_name=dereverb_model, base_name=base_name
     )
 
     # Step 4 (optional): Split instrumental into stems
     stems_result = {"drums": None, "bass": None, "guitar": None, "piano": None, "other": None}
     if enable_stems and stem_model:
-        raw_stems = separate_instrumental_stems(
-            instrumentals_path, out_folder, model_display_name=stem_model
-        )
-        # Rename stem files with standardized names
-        for stem_name, src_path in raw_stems.items():
-            if stem_name == 'vocal_remnants':
-                dst_name = f'{base_name}_Stem_Vocal_Remnants.wav'
-            else:
-                dst_name = f'{base_name}_Stem_{stem_name.capitalize()}.wav'
-            dst_path = os.path.join(out_folder, dst_name)
-            if src_path != dst_path and os.path.exists(src_path):
-                os.rename(src_path, dst_path)
-            stems_result[stem_name] = dst_path
+        stems_result.update(separate_instrumental_stems(
+            instrumentals_path, out_folder, model_display_name=stem_model, base_name=base_name
+        ))
 
     return (
         instrumentals_path, backup_vocals_path, main_vocals_path, main_vocals_dereverb_path,
@@ -114,21 +104,9 @@ def stem_separator_webui(input_audio, stem_model):
     os.makedirs(out_folder, exist_ok=True)
 
     stems_result = {"drums": None, "bass": None, "guitar": None, "piano": None, "other": None, "vocal_remnants": None}
-    
-    raw_stems = separate_instrumental_stems(
-        input_path, out_folder, model_display_name=stem_model
-    )
-    
-    # Rename stem files with standardized names
-    for stem_name, src_path in raw_stems.items():
-        if stem_name == 'vocal_remnants':
-            dst_name = f'{base_name}_Stem_Vocal_Remnants.wav'
-        else:
-            dst_name = f'{base_name}_Stem_{stem_name.capitalize()}.wav'
-        dst_path = os.path.join(out_folder, dst_name)
-        if src_path != dst_path and os.path.exists(src_path):
-            os.rename(src_path, dst_path)
-        stems_result[stem_name] = dst_path
+    stems_result.update(separate_instrumental_stems(
+        input_path, out_folder, model_display_name=stem_model, base_name=base_name
+    ))
 
     return (
         stems_result.get("drums"), stems_result.get("bass"),

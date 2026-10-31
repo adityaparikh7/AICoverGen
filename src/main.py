@@ -1,13 +1,16 @@
 import argparse
 import gc
 import hashlib
+import json
 import os
 
 # Ensure PyTorch falls back to CPU for unsupported MPS operations.
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+# Multi-threaded OpenMP segfaults RVC inference on macOS (same as tools.py)
+os.environ["OMP_NUM_THREADS"] = "1"
 
-import shlex
 import subprocess
+import traceback
 from contextlib import suppress
 from urllib.parse import urlparse, parse_qs
 
@@ -16,6 +19,7 @@ import librosa
 import numpy as np
 import soundfile as sf
 import sox
+import torch
 import yt_dlp
 from pedalboard import Pedalboard, Reverb, Compressor, HighpassFilter
 from pedalboard.io import AudioFile
@@ -39,6 +43,9 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 rvc_models_dir = os.path.join(BASE_DIR, 'rvc_models')
 output_dir = os.path.join(BASE_DIR, 'song_output')
+
+# Records which separation models produced the cached stems in a song directory
+SEPARATION_MANIFEST = 'separation.json'
 
 
 def get_youtube_video_id(url, ignore_playlist=True):
@@ -73,10 +80,10 @@ def get_youtube_video_id(url, ignore_playlist=True):
     return None
 
 
-def yt_download(link):
+def yt_download(link, out_dir):
     ydl_opts = {
         'format': 'bestaudio',
-        'outtmpl': '%(title)s',
+        'outtmpl': os.path.join(out_dir, '%(title)s'),
         'nocheckcertificate': True,
         'ignoreerrors': True,
         'no_warnings': True,
@@ -86,7 +93,10 @@ def yt_download(link):
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         result = ydl.extract_info(link, download=True)
-        download_path = ydl.prepare_filename(result, outtmpl='%(title)s.mp3')
+        # ignoreerrors makes yt_dlp return None instead of raising
+        if result is None:
+            raise Exception(f'Failed to download {link}.')
+        download_path = ydl.prepare_filename(result, outtmpl=os.path.join(out_dir, '%(title)s.mp3'))
 
     return download_path
 
@@ -118,6 +128,7 @@ def get_rvc_model(voice_model, is_webui):
 def get_audio_paths(song_dir):
     orig_song_path = None
     instrumentals_path = None
+    main_vocals_path = None
     main_vocals_dereverb_path = None
     backup_vocals_path = None
     stem_paths = {}
@@ -125,10 +136,13 @@ def get_audio_paths(song_dir):
     for file in os.listdir(song_dir):
         if file.endswith('_Instrumental.wav'):
             instrumentals_path = os.path.join(song_dir, file)
-            orig_song_path = instrumentals_path.replace('_Instrumental', '')
+            orig_song_path = instrumentals_path[:-len('_Instrumental.wav')] + '.wav'
 
         elif file.endswith('_Vocals_Main_DeReverb.wav'):
             main_vocals_dereverb_path = os.path.join(song_dir, file)
+
+        elif file.endswith('_Vocals_Main.wav'):
+            main_vocals_path = os.path.join(song_dir, file)
 
         elif file.endswith('_Vocals_Backup.wav'):
             backup_vocals_path = os.path.join(song_dir, file)
@@ -146,17 +160,34 @@ def get_audio_paths(song_dir):
         elif file.endswith('_Stem_Vocal_Remnants.wav'):
             stem_paths['vocal_remnants'] = os.path.join(song_dir, file)
 
+    # With de-reverb skipped, the main vocals are the RVC input
+    if main_vocals_dereverb_path is None:
+        main_vocals_dereverb_path = main_vocals_path
+
     return orig_song_path, instrumentals_path, main_vocals_dereverb_path, backup_vocals_path, stem_paths
 
 
-def convert_to_stereo(audio_path):
+def read_separation_manifest(song_dir):
+    try:
+        with open(os.path.join(song_dir, SEPARATION_MANIFEST), encoding='utf8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_separation_manifest(song_dir, manifest):
+    with open(os.path.join(song_dir, SEPARATION_MANIFEST), 'w', encoding='utf8') as f:
+        json.dump(manifest, f, indent=2)
+
+
+def convert_to_stereo(audio_path, out_dir):
     wave, sr = librosa.load(audio_path, mono=False, sr=44100)
 
     # check if mono
     if type(wave[0]) != np.ndarray:
-        stereo_path = f'{os.path.splitext(audio_path)[0]}_stereo.wav'
-        command = shlex.split(f'ffmpeg -y -loglevel error -i "{audio_path}" -ac 2 -f wav "{stereo_path}"')
-        subprocess.run(command)
+        stereo_path = os.path.join(out_dir, f'{os.path.splitext(os.path.basename(audio_path))[0]}_stereo.wav')
+        command = ['ffmpeg', '-y', '-loglevel', 'error', '-i', audio_path, '-ac', '2', '-f', 'wav', stereo_path]
+        subprocess.run(command, check=True)
         return stereo_path
     else:
         return audio_path
@@ -190,56 +221,55 @@ def display_progress(message, percent, is_webui, progress=None):
         print(message)
 
 
+def separate_stems(instrumentals_path, song_dir, stem_model, base_name):
+    # Drop stems from an earlier run so a model with fewer stems doesn't leave stale ones behind
+    for file in os.listdir(song_dir):
+        if file.startswith(f'{base_name}_Stem_'):
+            os.remove(os.path.join(song_dir, file))
+
+    return separate_instrumental_stems(instrumentals_path, song_dir, model_display_name=stem_model, base_name=base_name)
+
+
 def preprocess_song(song_input, song_id, is_webui, input_type,
                     vocal_model=None, karaoke_model=None, dereverb_model=None,
                     stem_model=None, progress=None):
-    keep_orig = False
+    song_output_dir = os.path.join(output_dir, song_id)
     if input_type == 'yt':
         display_progress('[~] Downloading song...', 0, is_webui, progress)
         song_link = song_input.split('&')[0]
-        orig_song_path = yt_download(song_link)
-    elif input_type == 'local':
-        orig_song_path = song_input
-        keep_orig = True
+        orig_song_path = yt_download(song_link, song_output_dir)
     else:
-        orig_song_path = None
+        orig_song_path = song_input
 
-    song_output_dir = os.path.join(output_dir, song_id)
-    orig_song_path = convert_to_stereo(orig_song_path)
+    base_name = os.path.splitext(os.path.basename(orig_song_path))[0]
+    stereo_song_path = convert_to_stereo(orig_song_path, song_output_dir)
 
     display_progress('[~] Separating Vocals from Instrumental...', 0.1, is_webui, progress)
     vocals_path, instrumentals_path = separate_vocals_instrumental(
-        orig_song_path, song_output_dir, model_display_name=vocal_model
+        stereo_song_path, song_output_dir, model_display_name=vocal_model, base_name=base_name
     )
+    if stereo_song_path != orig_song_path:
+        os.remove(stereo_song_path)
 
     display_progress('[~] Separating Main Vocals from Backup Vocals...', 0.2, is_webui, progress)
     main_vocals_path, backup_vocals_path = separate_main_backup_vocals(
-        vocals_path, song_output_dir, model_display_name=karaoke_model
+        vocals_path, song_output_dir, model_display_name=karaoke_model, base_name=base_name
     )
 
     display_progress('[~] Applying DeReverb to Vocals...', 0.3, is_webui, progress)
     main_vocals_dereverb_path = apply_dereverb(
-        main_vocals_path, song_output_dir, model_display_name=dereverb_model
+        main_vocals_path, song_output_dir, model_display_name=dereverb_model, base_name=base_name
     )
+    if main_vocals_dereverb_path == main_vocals_path:
+        # De-reverb skipped: a de-reverb left from an earlier run would otherwise be picked up from the cache
+        with suppress(FileNotFoundError):
+            os.remove(os.path.join(song_output_dir, f'{base_name}_Vocals_Main_DeReverb.wav'))
 
     # Optional: separate instrumental into individual stems
     stem_paths = {}
     if stem_model is not None:
         display_progress('[~] Separating Instrumental into Stems (drums, bass, guitar, piano)...', 0.4, is_webui, progress)
-        raw_stems = separate_instrumental_stems(
-            instrumentals_path, song_output_dir, model_display_name=stem_model
-        )
-        # Rename stem files with standardized suffixes for caching
-        base_name = os.path.splitext(os.path.basename(orig_song_path))[0]
-        for stem_name, src_path in raw_stems.items():
-            if stem_name == 'vocal_remnants':
-                dst_name = f'{base_name}_Stem_Vocal_Remnants.wav'
-            else:
-                dst_name = f'{base_name}_Stem_{stem_name.capitalize()}.wav'
-            dst_path = os.path.join(song_output_dir, dst_name)
-            if src_path != dst_path and os.path.exists(src_path):
-                os.rename(src_path, dst_path)
-            stem_paths[stem_name] = dst_path
+        stem_paths = separate_stems(instrumentals_path, song_output_dir, stem_model, base_name)
 
     return orig_song_path, vocals_path, instrumentals_path, main_vocals_path, backup_vocals_path, main_vocals_dereverb_path, stem_paths
 
@@ -348,53 +378,44 @@ def song_cover_pipeline(song_input, voice_model, pitch_change, keep_files,
                 raise_exception(error_msg, is_webui)
 
         song_dir = os.path.join(output_dir, song_id)
-        stem_paths = {}
+        os.makedirs(song_dir, exist_ok=True)
 
-        if not os.path.exists(song_dir):
-            os.makedirs(song_dir)
+        # Cached stems are only reusable if the same separation models produced them
+        separation_models = {
+            'vocal_model': vocal_model or DEFAULT_VOCAL_MODEL,
+            'karaoke_model': karaoke_model or DEFAULT_KARAOKE_MODEL,
+            'dereverb_model': dereverb_model or DEFAULT_DEREVERB_MODEL,
+        }
+        manifest = read_separation_manifest(song_dir)
+        models_changed = any(manifest.get(key) != value for key, value in separation_models.items())
+        paths = get_audio_paths(song_dir)
+        vocals_path, main_vocals_path = None, None
+
+        # if any of the core audio files aren't available, came from other models, or keep intermediate files, rerun preprocess
+        if any(path is None for path in paths[:4]) or models_changed or keep_files:
             orig_song_path, vocals_path, instrumentals_path, main_vocals_path, backup_vocals_path, main_vocals_dereverb_path, stem_paths = preprocess_song(
                 song_input, song_id, is_webui, input_type,
                 vocal_model=vocal_model, karaoke_model=karaoke_model, dereverb_model=dereverb_model,
                 stem_model=stem_model,
                 progress=progress
             )
-
+            write_separation_manifest(song_dir, {**separation_models, 'stem_model': stem_model})
         else:
-            vocals_path, main_vocals_path = None, None
-            paths = get_audio_paths(song_dir)
+            orig_song_path, instrumentals_path, main_vocals_dereverb_path, backup_vocals_path, stem_paths = paths
+            # If stems were requested but not cached from this stem model, run stem separation only
+            if stem_model and (not stem_paths or manifest.get('stem_model') != stem_model):
+                display_progress('[~] Separating Instrumental into Stems...', 0.4, is_webui, progress)
+                base_name = os.path.splitext(os.path.basename(orig_song_path))[0]
+                stem_paths = separate_stems(instrumentals_path, song_dir, stem_model, base_name)
+                write_separation_manifest(song_dir, {**manifest, 'stem_model': stem_model})
 
-            # if any of the core audio files aren't available or keep intermediate files, rerun preprocess
-            if any(path is None for path in paths[:4]) or keep_files:
-                orig_song_path, vocals_path, instrumentals_path, main_vocals_path, backup_vocals_path, main_vocals_dereverb_path, stem_paths = preprocess_song(
-                    song_input, song_id, is_webui, input_type,
-                    vocal_model=vocal_model, karaoke_model=karaoke_model, dereverb_model=dereverb_model,
-                    stem_model=stem_model,
-                    progress=progress
-                )
-            else:
-                orig_song_path, instrumentals_path, main_vocals_dereverb_path, backup_vocals_path, stem_paths = paths
-                # If stems were requested but not cached, run stem separation only
-                if stem_model and not stem_paths:
-                    display_progress('[~] Separating Instrumental into Stems...', 0.4, is_webui, progress)
-                    raw_stems = separate_instrumental_stems(
-                        instrumentals_path, song_dir, model_display_name=stem_model
-                    )
-                    base_name = os.path.splitext(os.path.basename(orig_song_path))[0]
-                    for stem_name, src_path in raw_stems.items():
-                        if stem_name == 'vocal_remnants':
-                            dst_name = f'{base_name}_Stem_Vocal_Remnants.wav'
-                        else:
-                            dst_name = f'{base_name}_Stem_{stem_name.capitalize()}.wav'
-                        dst_path = os.path.join(song_dir, dst_name)
-                        if src_path != dst_path and os.path.exists(src_path):
-                            os.rename(src_path, dst_path)
-                        stem_paths[stem_name] = dst_path
-
+        song_base_name = os.path.splitext(os.path.basename(orig_song_path))[0]
         pitch_change = pitch_change * 12 + pitch_change_all
-        ai_vocals_path = os.path.join(song_dir, f'{os.path.splitext(os.path.basename(orig_song_path))[0]}_{voice_model}_p{pitch_change}_i{index_rate}_fr{filter_radius}_rms{rms_mix_rate}_pro{protect}_{f0_method}{"" if f0_method != "mangio-crepe" else f"_{crepe_hop_length}"}.wav')
-        ai_cover_path = os.path.join(song_dir, f'{os.path.splitext(os.path.basename(orig_song_path))[0]} ({voice_model} Ver).{output_format}')
+        ai_vocals_path = os.path.join(song_dir, f'{song_base_name}_{voice_model}_p{pitch_change}_i{index_rate}_fr{filter_radius}_rms{rms_mix_rate}_pro{protect}_{f0_method}{"" if f0_method != "mangio-crepe" else f"_{crepe_hop_length}"}.wav')
+        ai_cover_path = os.path.join(song_dir, f'{song_base_name} ({voice_model} Ver).{output_format}')
 
-        if not os.path.exists(ai_vocals_path):
+        # AI vocals converted from another model's stems are stale even if the RVC settings match
+        if models_changed or not os.path.exists(ai_vocals_path):
             display_progress('[~] Converting voice using RVC...', 0.5, is_webui, progress)
             voice_change(voice_model, main_vocals_dereverb_path, ai_vocals_path, pitch_change, f0_method, index_rate, filter_radius, rms_mix_rate, protect, crepe_hop_length, is_webui)
 
@@ -428,9 +449,18 @@ def song_cover_pipeline(song_input, voice_model, pitch_change, keep_files,
 
         if not keep_files:
             display_progress('[~] Removing intermediate audio files...', 0.95, is_webui, progress)
-            intermediate_files = [vocals_path, main_vocals_path, ai_vocals_mixed_path]
+            intermediate_files = [vocals_path, ai_vocals_mixed_path,
+                                  os.path.join(song_dir, f'{song_base_name}_Vocals_Main_Reverb.wav')]
+            # With de-reverb skipped, the main vocals are the cached RVC input
+            if main_vocals_path != main_vocals_dereverb_path:
+                intermediate_files.append(main_vocals_path)
+            # Only a downloaded song lives in song_dir; never delete a user's local file
+            if input_type == 'yt':
+                intermediate_files.append(orig_song_path)
             if pitch_change_all != 0:
-                if not (stem_paths and stem_model):
+                if stem_paths and stem_model:
+                    intermediate_files.extend(path for name, path in stem_paths.items() if name != 'vocal_remnants')
+                else:
                     intermediate_files.append(instrumentals_path)
                 intermediate_files.append(backup_vocals_path)
             for file in intermediate_files:
@@ -440,6 +470,7 @@ def song_cover_pipeline(song_input, voice_model, pitch_change, keep_files,
         return ai_cover_path
 
     except Exception as e:
+        traceback.print_exc()
         raise_exception(str(e), is_webui)
 
 
